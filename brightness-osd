@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import fcntl
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/brightness-osd-{os.getuid()}")
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "brightness-osd.sock")
+LOCK_PATH = os.path.join(RUNTIME_DIR, "brightness-osd.lock")
+HIDE_AFTER_MS = 900
+
+
+def brightness_percent() -> int:
+    output = subprocess.check_output(["brightnessctl", "-m"], text=True).strip()
+    fields = output.split(",")
+    return int(fields[3].rstrip("%"))
+
+
+def set_brightness(direction: str) -> int:
+    if direction == "up":
+        subprocess.run(["brightnessctl", "set", "+5%"], check=True, stdout=subprocess.DEVNULL)
+    elif direction == "down":
+        subprocess.run(["brightnessctl", "set", "5%-"], check=True, stdout=subprocess.DEVNULL)
+    else:
+        raise ValueError("direction must be up or down")
+    return brightness_percent()
+
+
+def send_percent(percent: int) -> bool:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.connect(SOCKET_PATH)
+        client.sendall(str(percent).encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+
+def spawn_server() -> None:
+    env = os.environ.copy()
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--server"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def update_osd(percent: int) -> None:
+    if send_percent(percent):
+        return
+    spawn_server()
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+        if send_percent(percent):
+            return
+
+
+def run_server() -> None:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    sock.setblocking(False)
+
+    css = b"""
+    window#osd {
+      background: rgba(22, 22, 24, 0.88);
+      border-radius: 24px;
+    }
+    label#icon {
+      color: #ffffff;
+      font-size: 42px;
+      font-weight: 600;
+    }
+    label#text {
+      color: #ffffff;
+      font-size: 28px;
+      font-weight: 600;
+    }
+    trough {
+      min-height: 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.24);
+    }
+    progress {
+      min-height: 10px;
+      border-radius: 999px;
+      background: #4da3ff;
+    }
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    window = Gtk.Window(type=Gtk.WindowType.POPUP)
+    window.set_name("osd")
+    window.set_decorated(False)
+    window.set_keep_above(True)
+    window.set_skip_taskbar_hint(True)
+    window.set_skip_pager_hint(True)
+    window.set_accept_focus(False)
+    window.set_app_paintable(True)
+    window.set_default_size(320, 180)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    box.set_border_width(28)
+    box.set_halign(Gtk.Align.CENTER)
+    box.set_valign(Gtk.Align.CENTER)
+
+    icon = Gtk.Label(label="☀")
+    icon.set_name("icon")
+    text = Gtk.Label(label="100%")
+    text.set_name("text")
+    bar = Gtk.ProgressBar()
+    bar.set_size_request(240, 10)
+
+    box.pack_start(icon, False, False, 0)
+    box.pack_start(text, False, False, 0)
+    box.pack_start(bar, False, False, 0)
+    window.add(box)
+
+    hide_source = None
+
+    def center_window() -> None:
+        window.realize()
+        screen = window.get_screen()
+        monitor = screen.get_monitor_at_point(*window.get_position())
+        geometry = screen.get_monitor_geometry(monitor)
+        width, height = window.get_size()
+        x = geometry.x + (geometry.width - width) // 2
+        y = geometry.y + int(geometry.height * 0.70) - height // 2
+        window.move(x, y)
+
+    def hide_window():
+        window.hide()
+        return False
+
+    def show_percent(percent: int) -> None:
+        nonlocal hide_source
+        percent = max(0, min(100, percent))
+        text.set_text(f"{percent}%")
+        bar.set_fraction(percent / 100.0)
+        window.show_all()
+        center_window()
+        if hide_source is not None:
+            GLib.source_remove(hide_source)
+        hide_source = GLib.timeout_add(HIDE_AFTER_MS, hide_window)
+
+    def on_socket(_fd, _condition):
+        try:
+            data = sock.recv(32)
+            percent = int(data.decode().strip())
+            show_percent(percent)
+        except Exception:
+            pass
+        return True
+
+    def cleanup(*_args):
+        try:
+            sock.close()
+        finally:
+            try:
+                os.unlink(SOCKET_PATH)
+            except FileNotFoundError:
+                pass
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    GLib.io_add_watch(sock.fileno(), GLib.IO_IN, on_socket)
+    Gtk.main()
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--server":
+        run_server()
+        return 0
+    if len(sys.argv) != 2 or sys.argv[1] not in {"up", "down"}:
+        print(f"Usage: {sys.argv[0]} up|down", file=sys.stderr)
+        return 2
+    percent = set_brightness(sys.argv[1])
+    update_osd(percent)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
